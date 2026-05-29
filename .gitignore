@@ -1,0 +1,18 @@
+﻿# 虚拟环境
+.venv/
+
+# 大数据文件
+simulation_data/
+HIT-bearing-dataset/
+plunger_pump_dataset.csv
+仿真数据源1.zip
+仿真数据源2.zip
+
+# 通用大文件类型
+*.csv
+*.mat
+*.npy
+*.zip
+*.rar
+*.dll
+*.lib
