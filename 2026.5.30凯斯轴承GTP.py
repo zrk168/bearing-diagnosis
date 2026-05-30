@@ -1,16 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 CWRU 轴承故障诊断 | CNN-Transformer 双任务分类
-特性: 防震荡训练 / 详细日志 / 早停机制 / 自动可视化 / 单工况适配
+修复版：解决数据堆叠报错 / 优化文件名解析 / 防震荡训练 / 完整可视化
 """
-import os
-import re
-import time
+import os, re, time
 import numpy as np
 import scipy.io
 import matplotlib
 
-matplotlib.use('Agg')  # 非交互环境安全绘图
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 from sklearn.model_selection import train_test_split
@@ -25,9 +23,9 @@ warnings.filterwarnings('ignore')
 
 
 # ══════════════════════════════════════════════════════════
-# 0. 基础配置 & 中文字体
+# 0. 配置 & 字体
 # ══════════════════════════════════════════════════════════
-def setup_chinese_font():
+def setup_font():
     for p in ['C:/Windows/Fonts/simhei.ttf', 'C:/Windows/Fonts/msyh.ttc']:
         if os.path.exists(p):
             plt.rcParams['font.family'] = fm.FontProperties(fname=p).get_name()
@@ -37,102 +35,94 @@ def setup_chinese_font():
     return False
 
 
-HAS_CN = setup_chinese_font()
+HAS_CN = setup_font()
 
 CFG = {
-    'data_dir': r'E:\柱塞泵\CWRU轴承数据\cwru_data\0HP',  # 当前仅跑0HP
+    'data_dir': r'E:\柱塞泵\CWRU轴承数据\cwru_data\0HP',
     'save_dir': r'./cwru_results',
     'seg_len': 1024,
-    'overlap': 0.5,
     'batch_size': 64,
     'epochs': 100,
     'lr': 1e-3,
     'weight_decay': 1e-4,
-    'patience': 15,  # 早停耐心值
+    'patience': 15,
     'seed': 42,
-    'label_smooth': 0.1,  # 防震荡关键
+    'label_smooth': 0.1,
 }
 os.makedirs(CFG['save_dir'], exist_ok=True)
 torch.manual_seed(CFG['seed'])
 np.random.seed(CFG['seed'])
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(CFG['seed'])
+    torch.backends.cudnn.benchmark = True
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'[设备] {DEVICE} | [数据路径] {CFG["data_dir"]}\n')
 
-# ══════════════════════════════════════════════════════════
-# 1. 数据加载 (适配CWRU标准命名)
-# ══════════════════════════════════════════════════════════
-# CWRU 0HP 标准文件名映射 (若你的文件名不同，修改此字典即可)
-CWRU_MAP = {
-    '97': 'Normal', '98': 'Normal', '99': 'Normal', '100': 'Normal',
-    '105': 'Ball_007', '106': 'Ball_007', '107': 'Ball_007', '108': 'Ball_007',
-    '109': 'Ball_014', '110': 'Ball_014', '111': 'Ball_014', '112': 'Ball_014',
-    '113': 'Ball_021', '114': 'Ball_021', '115': 'Ball_021', '116': 'Ball_021',
-    '117': 'IR_007', '118': 'IR_007', '119': 'IR_007', '120': 'IR_007',
-    '121': 'IR_014', '122': 'IR_014', '123': 'IR_014', '124': 'IR_014',
-    '125': 'IR_021', '126': 'IR_021', '127': 'IR_021', '128': 'IR_021',
-    '129': 'OR_007', '130': 'OR_007', '131': 'OR_007', '132': 'OR_007',
-    '133': 'OR_014', '134': 'OR_014', '135': 'OR_014', '136': 'OR_014',
-    '137': 'OR_021', '138': 'OR_021', '139': 'OR_021', '140': 'OR_021',
-}
 
-
+# ═════════════════════════════════════════════════════════
+# 1. 数据加载 (修复堆叠报错 & 优化解析逻辑)
+# ══════════════════════════════════════════════════════════
 def parse_label(fname):
-    base = os.path.splitext(fname)[0]
-    # 优先查表
-    if base in CWRU_MAP:
-        tag = CWRU_MAP[base]
+    """解析文件名，返回 (故障类型ID, 故障程度ID)"""
+    base = os.path.splitext(fname)[0].lower()
+    # 优先匹配故障关键词，避免误判
+    if '_b' in base or 'ball' in base:
+        f_type = 1
+    elif '_ir' in base or 'inner' in base:
+        f_type = 2
+    elif '_or' in base or 'outer' in base:
+        f_type = 3
     else:
-        # 正则 fallback
-        m = re.search(r'(?i)(normal|ball|inner|outer|ir|or|b)[_\-]?(\d{3})?', base)
-        tag = m.group(0) if m else 'Unknown'
+        f_type = 0  # 默认为正常
 
-    if 'Normal' in tag:
-        return 0, 0  # Type:Normal, Sev:Normal
-    if 'Ball' in tag:
-        return 1, int(tag.split('_')[1]) // 7
-    if 'IR' in tag or 'Inner' in tag:
-        return 2, int(tag.split('_')[1]) // 7
-    if 'OR' in tag or 'Outer' in tag:
-        return 3, int(tag.split('_')[1]) // 7
-    return -1, -1
+    if '007' in base:
+        sev = 1
+    elif '014' in base:
+        sev = 2
+    elif '021' in base:
+        sev = 3
+    else:
+        sev = 0
+    return f_type, sev
 
 
 def load_signal(fpath):
     mat = scipy.io.loadmat(fpath)
-    # 自动寻找包含 DE_time 的变量
     for k in mat:
-        if 'DE_time' in k and k[0] != '_':
-            return mat[k].flatten().astype(np.float32)
-    # 降级：取第一个数值数组
+        if 'DE_time' in k and k[0] != '_': return mat[k].flatten().astype(np.float32)
     for k in mat:
-        if isinstance(mat[k], np.ndarray) and mat[k].ndim == 2:
-            return mat[k].flatten().astype(np.float32)
+        if isinstance(mat[k], np.ndarray) and mat[k].ndim == 2: return mat[k].flatten().astype(np.float32)
     raise ValueError(f"无法读取信号: {fpath}")
 
 
-def slide_window(sig, L, ov):
-    step = int(L * (1 - ov))
-    return np.array([sig[i:i + L] for i in range(0, len(sig) - L + 1, step)], dtype=np.float32)
-
-
-def normalize_segments(segs):
+def segment_and_normalize(signal, seg_len):
+    n_samples = len(signal) // seg_len
+    if n_samples == 0: return np.zeros((0, seg_len), dtype=np.float32)
+    segs = signal[:n_samples * seg_len].reshape(n_samples, seg_len)
     mu = segs.mean(axis=1, keepdims=True)
     std = segs.std(axis=1, keepdims=True) + 1e-8
     return (segs - mu) / std
 
 
 def build_dataset(data_dir, cfg):
+    if not os.path.exists(data_dir): raise FileNotFoundError(f"路径不存在: {data_dir}")
     X, Y_type, Y_sev = [], [], []
     for fname in sorted(os.listdir(data_dir)):
         if not fname.endswith('.mat'): continue
         t, s = parse_label(fname)
-        if t == -1: continue
         sig = load_signal(os.path.join(data_dir, fname))
-        segs = normalize_segments(slide_window(sig, cfg['seg_len'], cfg['overlap']))
+        segs = segment_and_normalize(sig, cfg['seg_len'])
+        if len(segs) == 0: continue
+
         X.append(segs)
         Y_type.extend([t] * len(segs))
         Y_sev.extend([s] * len(segs))
-    return np.array(X, dtype=np.float32), np.array(Y_type, dtype=np.int64), np.array(Y_sev, dtype=np.int64)
+
+    # 修复：使用 vstack 将不同行数的数组垂直拼接
+    if len(X) == 0: raise ValueError("未加载到有效数据")
+    X_combined = np.vstack(X)
+    print(f"[数据] 共加载 {len(X_combined)} 个样本")
+    return X_combined.astype(np.float32), np.array(Y_type, dtype=np.int64), np.array(Y_sev, dtype=np.int64)
 
 
 # ══════════════════════════════════════════════════════════
@@ -140,7 +130,7 @@ def build_dataset(data_dir, cfg):
 # ══════════════════════════════════════════════════════════
 class BearingDS(Dataset):
     def __init__(self, X, yt, ys):
-        self.X = torch.from_numpy(X).unsqueeze(1)  # (N, 1, L)
+        self.X = torch.from_numpy(X).unsqueeze(1)
         self.yt = torch.from_numpy(yt)
         self.ys = torch.from_numpy(ys)
 
@@ -152,74 +142,34 @@ class BearingDS(Dataset):
 # ══════════════════════════════════════════════════════════
 # 3. CNN-Transformer 模型
 # ══════════════════════════════════════════════════════════
-class ConvBlock(nn.Module):
-    def __init__(self, ic, oc, k=7):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv1d(ic, oc, k, padding=k // 2, bias=False),
-            nn.BatchNorm1d(oc), nn.GELU(),
-            nn.Conv1d(oc, oc, k, padding=k // 2, bias=False),
-            nn.BatchNorm1d(oc), nn.GELU(),
-            nn.MaxPool1d(2)
-        )
-
-    def forward(self, x): return self.net(x)
-
-
 class CNNTransformer(nn.Module):
-    def __init__(self, seg_len, n_type=4, n_sev=4):
+    def __init__(self, in_channels=1, d_model=64, nhead=4, num_layers=2, n_type=4, n_sev=4, dropout=0.15):
         super().__init__()
-        # 1D CNN 特征提取
         self.cnn = nn.Sequential(
-            ConvBlock(1, 32, 7),
-            ConvBlock(32, 64, 5),
-            ConvBlock(64, 128, 3)
+            nn.Conv1d(in_channels, 32, 7, padding=3), nn.BatchNorm1d(32), nn.GELU(), nn.MaxPool1d(2),
+            nn.Conv1d(32, 64, 5, padding=2), nn.BatchNorm1d(64), nn.GELU(), nn.MaxPool1d(2),
+            nn.Conv1d(64, 128, 3, padding=1), nn.BatchNorm1d(128), nn.GELU(), nn.AdaptiveAvgPool1d(16)
         )
-        # 计算Transformer输入序列长度
-        with torch.no_grad():
-            tmp = self.cnn(torch.zeros(1, 1, seg_len))
-            seq_len, d_feat = tmp.shape[2], tmp.shape[1]
-
-        d_model = 64
-        self.proj = nn.Linear(d_feat, d_model)
-        self.pos_enc = nn.Parameter(torch.randn(1, seq_len, d_model) * 0.02)
-
-        # Transformer Encoder
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=4, dim_feedforward=d_model * 4,
-            dropout=0.2, batch_first=True, norm_first=True)
-        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=2)
-
-        # 双分类头
-        self.gap = nn.AdaptiveAvgPool1d(1)
-        self.head_type = nn.Sequential(nn.LayerNorm(d_model), nn.Dropout(0.2), nn.Linear(d_model, n_type))
-        self.head_sev = nn.Sequential(nn.LayerNorm(d_model), nn.Dropout(0.2), nn.Linear(d_model, n_sev))
+        self.proj = nn.Linear(128, d_model)
+        self.pos_enc = nn.Parameter(torch.randn(1, 16, d_model) * 0.02)
+        enc_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=d_model * 4,
+                                               dropout=dropout, batch_first=True, norm_first=True)
+        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+        self.head_type = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(), nn.Dropout(dropout),
+                                       nn.Linear(d_model, n_type))
+        self.head_sev = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(), nn.Dropout(dropout),
+                                      nn.Linear(d_model, n_sev))
 
     def forward(self, x):
-        f = self.cnn(x).permute(0, 2, 1)  # (B, T, C)
-        f = self.proj(f) + self.pos_enc  # (B, T, d)
-        f = self.transformer(f).permute(0, 2, 1)  # (B, d, T)
-        f = self.gap(f).squeeze(-1)  # (B, d)
+        f = self.cnn(x).permute(0, 2, 1)
+        f = self.proj(f) + self.pos_enc
+        f = self.transformer(f).mean(dim=1)
         return self.head_type(f), self.head_sev(f)
 
 
 # ══════════════════════════════════════════════════════════
-# 4. 训练组件 (防震荡设计)
+# 4. 训练组件
 # ══════════════════════════════════════════════════════════
-class SmoothCE(nn.Module):
-    def __init__(self, eps=0.1):
-        super().__init__()
-        self.eps = eps
-
-    def forward(self, logits, target):
-        n = logits.size(-1)
-        log_p = nn.functional.log_softmax(logits, dim=-1)
-        with torch.no_grad():
-            smooth = torch.full_like(log_p, self.eps / (n - 1))
-            smooth.scatter_(1, target.unsqueeze(1), 1.0 - self.eps)
-        return -(smooth * log_p).sum(-1).mean()
-
-
 class EarlyStopping:
     def __init__(self, patience, min_delta, save_path):
         self.patience, self.min_delta, self.path = patience, min_delta, save_path
@@ -246,7 +196,7 @@ def run_epoch(model, loader, crit, opt, device, train=True):
             if train:
                 opt.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # 防梯度爆炸/震荡
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 opt.step()
             tot_loss += loss.item() * len(X)
             ct += (pt.argmax(1) == yt).sum().item()
@@ -310,15 +260,98 @@ def plot_cm(y_true, y_pred, names, title, fpath):
 def main():
     print('[1/5] 加载数据...')
     X, yt, ys = build_dataset(CFG['data_dir'], CFG)
-    print(f'  样本总数: {len(X)} | 类型分布: {dict(zip(*np.unique(yt, return_counts=True)))}')
 
-    # 划分训练/验证集 (分层采样保证类别均衡)
-    X_tr, X_vl, yt_tr, yt_vl, ys_tr, ys_vl = train_test_split(
-        X, yt, ys, test_size=0.2, random_state=CFG['seed'], stratify=yt)
+    print('[2/5] 划分数据集...')
+    X_tr, X_vl, yt_tr, yt_vl, ys_tr, ys_vl = train_test_split(X, yt, ys, test_size=0.2, random_state=CFG['seed'],
+                                                              stratify=yt)
     print(f'  训练集: {len(X_tr)} | 验证集: {len(X_vl)}')
 
     tr_loader = DataLoader(BearingDS(X_tr, yt_tr, ys_tr), batch_size=CFG['batch_size'], shuffle=True, num_workers=0)
     vl_loader = DataLoader(BearingDS(X_vl, yt_vl, ys_vl), batch_size=CFG['batch_size'], shuffle=False, num_workers=0)
 
     type_names = ['Normal', 'Ball', 'InnerRace', 'OuterRace']
-    sev_names
+    sev_names = ['Normal', '轻度(007)', '中度(014)', '重度(021)']
+
+    print('[3/5] 初始化模型...')
+    model = CNNTransformer(n_type=4, n_sev=4).to(DEVICE)
+    total_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f'  参数量: {total_p:,} | 设备: {DEVICE}')
+
+    crit = nn.CrossEntropyLoss(label_smoothing=CFG['label_smooth'])
+    opt = optim.AdamW(model.parameters(), lr=CFG['lr'], weight_decay=CFG['weight_decay'])
+    sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=CFG['epochs'], eta_min=1e-5)
+    es = EarlyStopping(CFG['patience'], 1e-4, os.path.join(CFG['save_dir'], 'best_model.pth'))
+
+    hist = {'tl': [], 'vl': [], 'tat': [], 'vat': [], 'tas': [], 'vas': [], 'lr': []}
+
+    print('[4/5] 开始训练...\n')
+    header = f"{'Epoch':>5} | {'LR':>9} | {'TrLoss':>8} | {'ValLoss':>8} | {'TrAcc_T':>7} | {'ValAcc_T':>8} | {'TrAcc_S':>7} | {'ValAcc_S':>8} | {'Time':>5}"
+    print(header)
+    print('-' * len(header))
+
+    for ep in range(1, CFG['epochs'] + 1):
+        t0 = time.time()
+        tl, tat, tas = run_epoch(model, tr_loader, crit, opt, DEVICE, train=True)
+        vl, vat, vas = run_epoch(model, vl_loader, crit, None, DEVICE, train=False)
+        sched.step()
+        cur_lr = opt.param_groups[0]['lr']
+        elapsed = time.time() - t0
+
+        hist['tl'].append(tl);
+        hist['vl'].append(vl)
+        hist['tat'].append(tat);
+        hist['vat'].append(vat)
+        hist['tas'].append(tas);
+        hist['vas'].append(vas)
+        hist['lr'].append(cur_lr)
+
+        stop = es.step(vl, model, ep)
+        marker = ' ★' if es.cnt == 0 else ''
+
+        print(
+            f"  {ep:5d} | {cur_lr:9.2e} | {tl:8.4f} | {vl:8.4f} | {tat * 100:6.2f}% | {vat * 100:7.2f}% | {tas * 100:6.2f}% | {vas * 100:7.2f}% | {elapsed:4.1f}s{marker}")
+
+        if stop:
+            print(f'\n[早停触发] 验证集损失连续 {CFG["patience"]} 轮未下降，停止训练。')
+            print(f'[最优轮次] Epoch {es.best_ep} | 最优验证损失: {es.best:.4f}')
+            break
+
+    print('\n[5/5] 训练结束，生成报告...')
+    model.load_state_dict(torch.load(es.path, map_location=DEVICE))
+    model.eval()
+    with torch.no_grad():
+        X_vl_t = torch.from_numpy(X_vl).unsqueeze(1).to(DEVICE)
+        pt, ps = model(X_vl_t)
+        pred_t = pt.argmax(1).cpu().numpy()
+        pred_s = ps.argmax(1).cpu().numpy()
+
+    print('\n' + '=' * 65)
+    print('  📊 故障类型分类报告')
+    print('=' * 65)
+    print(classification_report(yt_vl, pred_t, target_names=type_names))
+
+    print('\n' + '=' * 65)
+    print('  📊 故障程度分类报告 (Severity)')
+    print('=' * 65)
+    print(classification_report(ys_vl, pred_s, target_names=sev_names))
+
+    # ── 绘制混淆矩阵 ──────────────────────────────────────
+    plot_cm(yt_vl, pred_t, type_names, '故障类型混淆矩阵', os.path.join(CFG['save_dir'], 'cm_type.png'))
+    plot_cm(ys_vl, pred_s, sev_names, '故障程度混淆矩阵', os.path.join(CFG['save_dir'], 'cm_severity.png'))
+
+    # ── 绘制训练曲线 ──────────────────────────────────────
+    plot_curves(hist, CFG['save_dir'])
+
+    print('\n' + '█' * 65)
+    print('  ✅ 全部完成！结果已保存至:')
+    print(f'  📁 {os.path.abspath(CFG["save_dir"])}')
+    print('   curves.png          (损失与准确率曲线)')
+    print('   cm_type.png         (故障类型混淆矩阵)')
+    print('   cm_severity.png     (故障程度混淆矩阵)')
+    print('   best_model.pth      (最优模型权重)')
+    print('█' * 65)
+
+
+if __name__ == '__main__':
+    main()
+
